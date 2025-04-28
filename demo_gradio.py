@@ -12,6 +12,7 @@ import safetensors.torch as sf
 import numpy as np
 import argparse
 import math
+import time
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
@@ -102,6 +103,9 @@ PREVIEW_STRIDE = 8          # show preview every 8 denoiser steps
 
 @torch.no_grad()
 def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+    # >>> ETA <<<: Track total start time
+    entire_start_time = time.time()
+
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -120,7 +124,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
 
         if not high_vram:
-            fake_diffusers_current_device(text_encoder, gpu)  # since we only encode one text - that is one model move and one encode, offload is same time consumption since it is also one load and one encode.
+            fake_diffusers_current_device(text_encoder, gpu)
             load_model_as_complete(text_encoder_2, target_device=gpu)
 
         llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
@@ -139,8 +143,6 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         H, W, C = input_image.shape
         height, width = find_nearest_bucket(H, W, resolution=640)
         input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
-
-        #Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
 
         input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
@@ -179,23 +181,26 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         history_pixels = None
         total_generated_latent_frames = 0
 
-        # Keep track of how many frames have been decoded so far
         last_decoded_frame = 0
 
         latent_paddings = reversed(range(total_latent_sections))
-
         if total_latent_sections > 4:
-            # In theory the latent_paddings should follow the above sequence, but it seems that duplicating some
-            # items looks better than expanding it when total_latent_sections > 4
-            # One can try to remove below trick and just
-            # use `latent_paddings = list(reversed(range(total_latent_sections)))` to compare
             latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
+
+        # >>> ETA <<<: Convert to list so we can index slices
+        latent_paddings_list = list(latent_paddings)
+        total_slices = len(latent_paddings_list)       # total number of slices
+        total_steps = total_slices * steps             # total steps across all slices
 
         prev_output = None
 
-        for latent_padding in latent_paddings:
+        # >>> ETA <<<: Enumerate slices
+        for slice_index, latent_padding in enumerate(latent_paddings_list):
             is_last_section = (latent_padding == 0)
             latent_padding_size = latent_padding * latent_window_size
+
+            # >>> ETA <<<: track the start time for *this slice*
+            slice_start_time = time.time()
 
             if stream.input_queue.top() == 'end':
                 stream.output_queue.push(('end', None))
@@ -221,13 +226,11 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 transformer.initialize_teacache(enable_teacache=False)
 
             def callback(d):
-                # Skip most steps to save VAE-decode and GUI overhead
                 if d["i"] % PREVIEW_STRIDE:
                     return
 
                 preview = d['denoised']
                 preview = vae_decode_fake(preview)
-
                 preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
                 preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
 
@@ -237,9 +240,32 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
                 current_step = d['i'] + 1
                 percentage = int(100.0 * current_step / steps)
+
+                slice_time_spent = time.time() - slice_start_time
+                slice_steps_done = current_step
+                slice_eta_sec = ((steps - slice_steps_done) * (slice_time_spent / slice_steps_done)) if slice_steps_done else 0
+
+                total_steps_done = slice_index * steps + current_step
+                total_time_spent = time.time() - entire_start_time
+                total_eta_sec = ((total_steps - total_steps_done) * (total_time_spent / total_steps_done)) if total_steps_done else 0
+
+                def format_eta(seconds):
+                    return f'{int(seconds)//3600}:{(int(seconds)//60)%60:02}:{int(seconds)%60:02}'
+
+                eta_info = (
+                    f'<div style="margin-top:8px; text-align:center; font-family:sans-serif; color:#555;">'
+                    f'ETA (slice): {format_eta(slice_eta_sec)} &nbsp;|&nbsp; ETA (total): {format_eta(total_eta_sec)}'
+                    '</div>'
+                )
+
+                desc = (f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, '
+                        f'Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30):.2f} seconds (FPS-30). '
+                        'The video is being extended now ...')
+
                 hint = f'Sampling {current_step}/{steps}'
-                desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30) :.2f} seconds (FPS-30). The video is being extended now ...'
-                stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
+                progress_bar_html = make_progress_bar_html(percentage, hint) + eta_info  # append ETA below bar
+
+                stream.output_queue.push(('progress', (preview, desc, progress_bar_html)))
                 return
 
             generated_latents = sample_hunyuan(
@@ -296,7 +322,6 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 # Only decode newly added frames + overlap
                 overlapped_frames = latent_window_size * 4 - 3
                 new_frames = total_generated_latent_frames - last_decoded_frame
-                # We decode from (last_decoded_frame - overlapped_frames) up to total_generated_latent_frames
                 start_decode = max(0, last_decoded_frame - overlapped_frames)
                 end_decode = total_generated_latent_frames
 
