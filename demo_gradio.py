@@ -99,7 +99,7 @@ stream = AsyncStream()
 outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
 
-PREVIEW_STRIDE = 8          # show preview every 8 denoiser steps
+PREVIEW_STRIDE = 1          # show preview every 8 denoiser steps
 
 @torch.no_grad()
 def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
