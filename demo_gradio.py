@@ -437,20 +437,31 @@ def worker(
             # ==============================
             #    PARTIAL DECODING CHANGE
             # ==============================
+            # how many frames to re-decode for smooth overlap
+            overlap = latent_window_size * 4 - 3
+
             if history_pixels is None:
-                # First time: decode everything
-                history_pixels = vae_decode(real_history_latents, vae).cpu()
+                # very first time: decode everything
+                history_pixels   = vae_decode(real_history_latents, vae).cpu()
                 last_decoded_frame = total_generated_latent_frames
             else:
-                # Only decode newly added frames + overlap
-                overlapped_frames = latent_window_size * 4 - 3
-                new_frames = total_generated_latent_frames - last_decoded_frame
-                start_decode = max(0, last_decoded_frame - overlapped_frames)
-                end_decode = total_generated_latent_frames
+                # figure out the window [start:end] we need to decode
+                start = max(0, last_decoded_frame - overlap)
+                end   = total_generated_latent_frames
 
-                chunk_latents = real_history_latents[:, :, start_decode:end_decode, :, :]
-                current_pixels = vae_decode(chunk_latents, vae).cpu()
-                history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
+                # slice out just that chunk of latents
+                chunk_latents = real_history_latents[:, :, start:end, :, :]
+
+                # decode only that chunk
+                decoded_chunk = vae_decode(chunk_latents, vae).cpu()
+
+                # now rebuild history_pixels by keeping the untouched prefix up to `start`
+                # and then appending our freshly decoded chunk
+                history_pixels = torch.cat(
+                    [history_pixels[:, :, :start, :, :], 
+                    decoded_chunk],
+                    dim=2
+                )
 
                 last_decoded_frame = total_generated_latent_frames
             # ==============================
@@ -557,9 +568,9 @@ quick_prompts = [
 ]
 quick_prompts = [[x] for x in quick_prompts]
 
-
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
+
 with block:
     settings = gr.BrowserState(
         {},
@@ -568,43 +579,123 @@ with block:
     )
 
     gr.Markdown('# FramePack')
+
     with gr.Row():
         with gr.Column():
-            input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
+            # 1) Hidden uploader – drop & clear itself on upload
+            uploader = gr.Image(
+                sources='upload', type='numpy',
+                label='Drop an image here',
+                height=200      # <-- smaller drop area
+            )
+            # 2) Visible preview widget (starts hidden)
+            loaded_img = gr.Image(
+                label='Current Image Preview',
+                type='numpy',
+                interactive=False,
+                visible=False,
+                height=240
+            )
+
+            #
+            # Now the rest of your prompt, quick_prompts, start_button, etc.
+            #
             prompt = gr.Textbox(label="Prompt", value='')
-            example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
-            example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
+            example_quick_prompts = gr.Dataset(
+                samples=quick_prompts,
+                label='Quick List',
+                samples_per_page=1000,
+                components=[prompt]
+            )
+            example_quick_prompts.click(
+                lambda x: x[0],
+                inputs=[example_quick_prompts],
+                outputs=prompt,
+                show_progress=False,
+                queue=False
+            )
 
-            with gr.Row():
-                start_button = gr.Button(value="Start Generation")
-                end_button = gr.Button(value="End Generation", interactive=False)
+            # 3) Start / End buttons (must exist before we hook uploader)
+            start_button = gr.Button("Start Generation", interactive=False)
+            end_button   = gr.Button("End Generation",   interactive=False)
 
+            # 4) On each drop: show in preview, clear uploader, enable Start
+            def _on_upload(img):
+                return (
+                    gr.update(value=img, visible=True),   # set preview
+                    gr.update(value=None),                # clear uploader
+                    gr.update(interactive=img is not None)  # enable start
+                )
+
+            uploader.upload(
+                fn=_on_upload,
+                inputs=[uploader],
+                outputs=[loaded_img, uploader, start_button],
+                show_progress=False,
+                queue=False
+            )
+
+            #
+            # Extra UI
+            #
             with gr.Group():
-                use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
+                use_teacache = gr.Checkbox(
+                    label='Use TeaCache', value=True,
+                    info='Faster speed, but often makes hands and fingers slightly worse.'
+                )
 
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
                 seed = gr.Number(label="Seed", value=31337, precision=0)
 
-                total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
-                latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
-                steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
+                total_second_length = gr.Slider(
+                    label="Total Video Length (Seconds)",
+                    minimum=1, maximum=120, value=5, step=0.1
+                )
+                latent_window_size = gr.Slider(
+                    label="Latent Window Size", minimum=1, maximum=33,
+                    value=9, step=1, visible=False  # Should not change
+                )
+                steps = gr.Slider(
+                    label="Steps", minimum=1, maximum=100,
+                    value=25, step=1,
+                    info='Changing this value is not recommended.'
+                )
 
-                cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=False)  # Should not change
-                gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01, info='Changing this value is not recommended.')
-                rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
+                cfg = gr.Slider(
+                    label="CFG Scale", minimum=1.0, maximum=32.0,
+                    value=1.0, step=0.01, visible=False  # Should not change
+                )
+                gs = gr.Slider(
+                    label="Distilled CFG Scale", minimum=1.0, maximum=32.0,
+                    value=10.0, step=0.01,
+                    info='Changing this value is not recommended.'
+                )
+                rs = gr.Slider(
+                    label="CFG Re-Scale", minimum=0.0, maximum=1.0,
+                    value=0.0, step=0.01, visible=False  # Should not change
+                )
 
-                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
+                gpu_memory_preservation = gr.Slider(
+                    label="GPU Inference Preserved Memory (GB) (larger means slower)",
+                    minimum=6, maximum=128,
+                    value=6, step=0.1,
+                    info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed."
+                )
 
-                mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
-                
-                # Components whose values you want to remember:
+                mp4_crf = gr.Slider(
+                    label="MP4 Compression", minimum=0, maximum=100,
+                    value=16, step=1,
+                    info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. "
+                )
+
+                # components whose values you want to remember
                 persist_comps = {
                     "seed":   seed,
                     "length": total_second_length,
                     "steps":  steps,
                     "gs":     gs,
                     "memory": gpu_memory_preservation,
-                    "teacache": use_teacache,
+                    "teacache": use_teacache
                 }
 
                 def _save(*vals):
@@ -632,22 +723,60 @@ with block:
                 )
 
         with gr.Column():
-            preview_image = gr.Image(label="Next Latents", height=200, visible=False)
-            result_video = gr.Video(label="Finished Frames", autoplay=True, show_share_button=False, height=512, loop=True)
-            gr.Markdown('Note that the ending actions will be generated before the starting actions due to the inverted sampling. If the starting action is not in the video, you just need to wait, and it will be generated later.')
+            result_video = gr.Video(
+                label="Finished Frames", autoplay=True,
+                show_share_button=False, height=512, loop=True
+            )
+
             progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
 
-    gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
+            preview_image = gr.Image(
+                label="Next Latents", height=200, visible=False
+            )
 
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf]
-    start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
+            gr.Markdown(
+                'Note that the ending actions will be generated before the starting '
+                'actions due to the inverted sampling. If the starting action is not '
+                'in the video, you just need to wait, and it will be generated later.'
+            )
+
+    gr.HTML(
+        '<div style="text-align:center; margin-top:20px;">'
+        'Share your results and find ideas at the '
+        '<a href="https://x.com/search?q=framepack&f=live" target="_blank">'
+        'FramePack Twitter (X) thread</a></div>'
+    )
+
+    #
+    # The actual inputs to your "Start Generation"
+    # are "loaded_img" (the current preview),
+    # plus prompt, n_prompt, etc.
+    #
+    ips = [
+        loaded_img, prompt, n_prompt, seed, total_second_length,
+        latent_window_size, steps, cfg, gs, rs,
+        gpu_memory_preservation, use_teacache, mp4_crf
+    ]
+
+    start_button.click(
+        fn=process,
+        inputs=ips,
+        outputs=[
+            result_video,
+            preview_image,
+            progress_desc,
+            progress_bar,
+            start_button,
+            end_button
+        ]
+    )
+
     end_button.click(fn=end_process)
-
 
 block.launch(
     server_name=args.server,
     server_port=args.port,
     share=args.share,
-    inbrowser=args.inbrowser,
+    inbrowser=args.inbrowser
 )
