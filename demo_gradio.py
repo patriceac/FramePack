@@ -13,6 +13,9 @@ import numpy as np
 import argparse
 import math
 import time
+import platform
+if platform.system() == 'Windows':
+    import ctypes
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
@@ -103,6 +106,14 @@ PREVIEW_STRIDE = 1          # show preview every 8 denoiser steps
 
 @torch.no_grad()
 def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+    # >>> NO-SLEEP BEGIN <<<
+    if platform.system() == 'Windows':
+        ES_CONTINUOUS = 0x80000000
+        ES_SYSTEM_REQUIRED = 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+        )
+
     # >>> ETA <<<: Track total start time
     entire_start_time = time.time()
 
@@ -361,6 +372,13 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             unload_complete_models(
                 text_encoder, text_encoder_2, image_encoder, vae, transformer
             )
+
+    finally:
+        # >>> NO-SLEEP RESTORE BEGIN <<<
+        if platform.system() == 'Windows':
+            ES_CONTINUOUS = 0x80000000
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+        # >>> NO-SLEEP RESTORE END <<<
 
     stream.output_queue.push(('end', None))
     return
