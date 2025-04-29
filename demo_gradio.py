@@ -16,6 +16,7 @@ import time
 import platform
 if platform.system() == 'Windows':
     import ctypes
+import threading  # >>> TIMER <<<
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
@@ -105,7 +106,11 @@ os.makedirs(outputs_folder, exist_ok=True)
 PREVIEW_STRIDE = 1          # show preview every 8 denoiser steps
 
 @torch.no_grad()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+def worker(
+    input_image, prompt, n_prompt, seed, total_second_length,
+    latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation,
+    use_teacache, mp4_crf
+):
     # >>> NO-SLEEP BEGIN <<<
     if platform.system() == 'Windows':
         ES_CONTINUOUS = 0x80000000
@@ -113,9 +118,20 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         ctypes.windll.kernel32.SetThreadExecutionState(
             ES_CONTINUOUS | ES_SYSTEM_REQUIRED
         )
+    # >>> NO-SLEEP END <<<
 
-    # >>> ETA <<<: Track total start time
+    # >>> TIMER <<<: We'll store progress info for the timer thread to read.
     entire_start_time = time.time()
+    progress_data = {
+        "entire_start_time": entire_start_time,
+        "slice_index": 0,
+        "slice_start_time": time.time(),
+        "current_step": 0,
+        "steps": steps,
+        "total_slices": 0,
+        "total_steps": 0,
+        "finished": False,  # to signal the timer to stop
+    }
 
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
@@ -123,6 +139,59 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     job_id = generate_timestamp()
 
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
+
+    # >>> TIMER <<<: define the timer function
+    def timer_func():
+        while not progress_data["finished"]:
+            time.sleep(1.0)
+
+            # pull current values
+            preview = progress_data.get("last_preview")
+            desc    = progress_data.get("last_desc", "")
+
+            # recompute progress
+            current = progress_data["current_step"]
+            total   = progress_data["steps"]
+            pct     = int(100 * current / total) if total else 0
+            hint    = f"Sampling {current}/{total}"
+
+            # timestamps
+            now = time.time()
+            # elapsed total
+            etot = now - progress_data["entire_start_time"]
+            # elapsed slice & ETA slice
+            slice_elapsed = now - progress_data["slice_start_time"]
+            done_slice    = current
+            eta_slice = ((total - done_slice) * (slice_elapsed / done_slice)) if done_slice else 0.0
+            # total ETA
+            done_total = progress_data["slice_index"] * total + current
+            eta_total  = ((progress_data["total_steps"] - done_total) * (etot / done_total)) if done_total else 0.0
+
+            # helper to format hh:mm:ss
+            def format_hms(seconds):
+                h = int(seconds) // 3600
+                m = (int(seconds) % 3600) // 60
+                s = int(seconds) % 60
+                return f"{h}:{m:02}:{s:02}"
+
+            # build timers HTML
+            timers_html = (
+                '<div style="margin-top:8px; text-align:center; font-family:sans-serif; color:#555;">'
+                f'⏱️ Elapsed: {format_hms(etot)} &nbsp;|&nbsp; '
+                f'ETA (slice): {format_hms(eta_slice)} &nbsp;|&nbsp; '
+                f'ETA (total): {format_hms(eta_total)}'
+                '</div>'
+            )
+
+            # combine progress bar + timers
+            new_html = make_progress_bar_html(pct, hint) + timers_html
+
+            # push updated UI
+            stream.output_queue.push(('progress', (preview, desc, new_html)))
+
+    # >>> TIMER <<<: start the timer thread
+    timer_thread = threading.Thread(target=timer_func, daemon=True)
+    timer_thread.start()
 
     try:
         # Clean GPU
@@ -138,12 +207,16 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             fake_diffusers_current_device(text_encoder, gpu)
             load_model_as_complete(text_encoder_2, target_device=gpu)
 
-        llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+        llama_vec, clip_l_pooler = encode_prompt_conds(
+            prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2
+        )
 
         if cfg == 1:
             llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
         else:
-            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(
+                n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2
+            )
 
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
@@ -203,15 +276,18 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         total_slices = len(latent_paddings_list)       # total number of slices
         total_steps = total_slices * steps             # total steps across all slices
 
+        progress_data["total_slices"] = total_slices
+        progress_data["total_steps"] = total_steps
+
         prev_output = None
 
-        # >>> ETA <<<: Enumerate slices
         for slice_index, latent_padding in enumerate(latent_paddings_list):
+            progress_data["slice_index"] = slice_index
+            progress_data["slice_start_time"] = time.time()
+            progress_data["current_step"] = 0
+
             is_last_section = (latent_padding == 0)
             latent_padding_size = latent_padding * latent_window_size
-
-            # >>> ETA <<<: track the start time for *this slice*
-            slice_start_time = time.time()
 
             if stream.input_queue.top() == 'end':
                 stream.output_queue.push(('end', None))
@@ -220,7 +296,14 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}')
 
             indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
-            clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
+            (
+                clean_latent_indices_pre,
+                blank_indices,
+                latent_indices,
+                clean_latent_indices_post,
+                clean_latent_2x_indices,
+                clean_latent_4x_indices
+            ) = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
             clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
 
             clean_latents_pre = start_latent.to(history_latents)
@@ -237,45 +320,74 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 transformer.initialize_teacache(enable_teacache=False)
 
             def callback(d):
+                # Skip if not a preview step
                 if d["i"] % PREVIEW_STRIDE:
                     return
 
+                # Decode preview latents
                 preview = d['denoised']
                 preview = vae_decode_fake(preview)
                 preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
                 preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
 
+                # Check if user ended
                 if stream.input_queue.top() == 'end':
                     stream.output_queue.push(('end', None))
                     raise KeyboardInterrupt('User ends the task.')
 
+                # Current step
                 current_step = d['i'] + 1
+                progress_data["current_step"] = current_step
+
                 percentage = int(100.0 * current_step / steps)
 
-                slice_time_spent = time.time() - slice_start_time
+                # Slice timing
+                slice_time_spent = time.time() - progress_data["slice_start_time"]
                 slice_steps_done = current_step
-                slice_eta_sec = ((steps - slice_steps_done) * (slice_time_spent / slice_steps_done)) if slice_steps_done else 0
+                if slice_steps_done > 0:
+                    slice_eta_sec = (steps - slice_steps_done) * (slice_time_spent / slice_steps_done)
+                else:
+                    slice_eta_sec = 0.0
 
-                total_steps_done = slice_index * steps + current_step
-                total_time_spent = time.time() - entire_start_time
-                total_eta_sec = ((total_steps - total_steps_done) * (total_time_spent / total_steps_done)) if total_steps_done else 0
+                # Total timing
+                total_steps_done = progress_data["slice_index"] * steps + current_step
+                total_time_spent = time.time() - progress_data["entire_start_time"]
+                if total_steps_done > 0:
+                    total_eta_sec = (progress_data["total_steps"] - total_steps_done) * (total_time_spent / total_steps_done)
+                else:
+                    total_eta_sec = 0.0
 
-                def format_eta(seconds):
+                def format_hms(seconds):
                     return f'{int(seconds)//3600}:{(int(seconds)//60)%60:02}:{int(seconds)%60:02}'
 
-                eta_info = (
+                slice_eta_str = format_hms(slice_eta_sec)
+                total_eta_str = format_hms(total_eta_sec)
+                elapsed_str = format_hms(total_time_spent)
+
+                # Build extra info for UI
+                eta_elapsed_info = (
                     f'<div style="margin-top:8px; text-align:center; font-family:sans-serif; color:#555;">'
-                    f'ETA (slice): {format_eta(slice_eta_sec)} &nbsp;|&nbsp; ETA (total): {format_eta(total_eta_sec)}'
+                    f'⏱️ Elapsed: {elapsed_str} &nbsp;|&nbsp; '
+                    f'ETA (slice): {slice_eta_str} &nbsp;|&nbsp; '
+                    f'ETA (total): {total_eta_str}'
                     '</div>'
                 )
 
-                desc = (f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, '
-                        f'Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30):.2f} seconds (FPS-30). '
-                        'The video is being extended now ...')
+                desc = (
+                    f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, '
+                    f'Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30):.2f} seconds (FPS-30). '
+                    'The video is being extended now ...'
+                )
 
                 hint = f'Sampling {current_step}/{steps}'
-                progress_bar_html = make_progress_bar_html(percentage, hint) + eta_info  # append ETA below bar
+                progress_bar_html = make_progress_bar_html(percentage, hint) + eta_elapsed_info
 
+                # >>> STORE LATEST <<<
+                progress_data["last_preview"] = preview
+                progress_data["last_desc"] = desc
+                progress_data["last_html"] = progress_bar_html
+
+                # Send progress event to update UI
                 stream.output_queue.push(('progress', (preview, desc, progress_bar_html)))
                 return
 
@@ -358,16 +470,16 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 try:
                     os.remove(prev_output)
                 except OSError:
-                    pass  # don’t crash if another process has it open
+                    pass
 
             prev_output = output_filename
             stream.output_queue.push(('file', output_filename))
 
             if is_last_section:
                 break
+
     except:
         traceback.print_exc()
-
         if not high_vram:
             unload_complete_models(
                 text_encoder, text_encoder_2, image_encoder, vae, transformer
@@ -380,6 +492,10 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
         # >>> NO-SLEEP RESTORE END <<<
 
+        # >>> TIMER <<<: stop timer thread
+        progress_data["finished"] = True
+        timer_thread.join()
+
     stream.output_queue.push(('end', None))
     return
 
@@ -391,9 +507,7 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
     yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True)
 
     stream = AsyncStream()
-
     async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf)
-
     output_filename = None
 
     while True:
@@ -401,14 +515,35 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
 
         if flag == 'file':
             output_filename = data
-            yield output_filename, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True)
+            yield (
+                output_filename, 
+                gr.update(), 
+                gr.update(), 
+                gr.update(), 
+                gr.update(interactive=False), 
+                gr.update(interactive=True)
+            )
 
-        if flag == 'progress':
+        elif flag == 'progress':
             preview, desc, html = data
-            yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True)
+            yield (
+                gr.update(), 
+                gr.update(visible=True, value=preview), 
+                desc, 
+                html, 
+                gr.update(interactive=False), 
+                gr.update(interactive=True)
+            )
 
-        if flag == 'end':
-            yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False)
+        elif flag == 'end':
+            yield (
+                output_filename, 
+                gr.update(visible=False), 
+                gr.update(), 
+                '', 
+                gr.update(interactive=True), 
+                gr.update(interactive=False)
+            )
             break
 
 
