@@ -201,6 +201,7 @@ def worker(
             )
 
         # Text encoding
+
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
 
         if not high_vram:
@@ -222,6 +223,7 @@ def worker(
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
 
         # Processing input image
+
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
 
         H, W, C = input_image.shape
@@ -232,6 +234,7 @@ def worker(
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
 
         # VAE encoding
+
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
 
         if not high_vram:
@@ -240,6 +243,7 @@ def worker(
         start_latent = vae_encode(input_image_pt, vae)
 
         # CLIP Vision
+
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
 
         if not high_vram:
@@ -249,6 +253,7 @@ def worker(
         image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
 
         # Dtype
+
         llama_vec = llama_vec.to(transformer.dtype)
         llama_vec_n = llama_vec_n.to(transformer.dtype)
         clip_l_pooler = clip_l_pooler.to(transformer.dtype)
@@ -256,6 +261,7 @@ def worker(
         image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
 
         # Sampling
+
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
 
         rnd = torch.Generator("cpu").manual_seed(seed)
@@ -264,8 +270,6 @@ def worker(
         history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32).cpu()
         history_pixels = None
         total_generated_latent_frames = 0
-
-        last_decoded_frame = 0
 
         latent_paddings = reversed(range(total_latent_sections))
         if total_latent_sections > 4:
@@ -280,13 +284,9 @@ def worker(
         progress_data["total_steps"] = total_steps
 
         prev_output = None
-
-        for slice_index, latent_padding in enumerate(latent_paddings_list):
-            progress_data["slice_index"] = slice_index
-            progress_data["slice_start_time"] = time.time()
-            progress_data["current_step"] = 0
-
-            is_last_section = (latent_padding == 0)
+        
+        for latent_padding in latent_paddings:
+            is_last_section = latent_padding == 0
             latent_padding_size = latent_padding * latent_window_size
 
             if stream.input_queue.top() == 'end':
@@ -434,26 +434,14 @@ def worker(
 
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
-            # ==============================
-            #    PARTIAL DECODING CHANGE
-            # ==============================
             if history_pixels is None:
-                # First time: decode everything
                 history_pixels = vae_decode(real_history_latents, vae).cpu()
-                last_decoded_frame = total_generated_latent_frames
             else:
-                # Only decode newly added frames + overlap
+                section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                 overlapped_frames = latent_window_size * 4 - 3
-                new_frames = total_generated_latent_frames - last_decoded_frame
-                start_decode = max(0, last_decoded_frame - overlapped_frames)
-                end_decode = total_generated_latent_frames
 
-                chunk_latents = real_history_latents[:, :, start_decode:end_decode, :, :]
-                current_pixels = vae_decode(chunk_latents, vae).cpu()
+                current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
                 history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
-
-                last_decoded_frame = total_generated_latent_frames
-            # ==============================
 
             if not high_vram:
                 unload_complete_models()
@@ -470,9 +458,10 @@ def worker(
                 try:
                     os.remove(prev_output)
                 except OSError:
-                    pass
+                    pass          # don’t crash if another process has it open
 
-            prev_output = output_filename
+            prev_output = output_filename    # remember for next iteration
+
             stream.output_queue.push(('file', output_filename))
 
             if is_last_section:
