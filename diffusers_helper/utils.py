@@ -307,8 +307,14 @@ def add_tensors_with_padding(tensor1, tensor2):
 
     new_shape = tuple(max(s1, s2) for s1, s2 in zip(shape1, shape2))
 
-    padded_tensor1 = torch.zeros(new_shape)
-    padded_tensor2 = torch.zeros(new_shape)
+    dtype = torch.promote_types(tensor1.dtype, tensor2.dtype)
+    device = tensor1.device
+
+    tensor1 = tensor1.to(dtype=dtype, device=device)
+    tensor2 = tensor2.to(dtype=dtype, device=device)
+
+    padded_tensor1 = torch.zeros(new_shape, dtype=dtype, device=device)
+    padded_tensor2 = torch.zeros(new_shape, dtype=dtype, device=device)
 
     padded_tensor1[tuple(slice(0, s) for s in shape1)] = tensor1
     padded_tensor2[tuple(slice(0, s) for s in shape2)] = tensor2
